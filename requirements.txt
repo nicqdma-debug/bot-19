@@ -1,5 +1,2 @@
 discord.py
 python-dotenv
-express
-discord-oauth2
-express-session
