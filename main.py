@@ -1,8 +1,10 @@
 import os
 import discord
 from discord.ext import commands
-from discord.ui import View, Select
+from discord.ui import View, Select, Button
 from dotenv import load_dotenv
+import datetime
+import io
 
 load_dotenv()
 
@@ -19,28 +21,29 @@ def get_id(key):
 CAT_BRACCIO_ID = get_id("TICKET_CATEGORY_BRACCIO")
 CAT_INFO_ID    = get_id("TICKET_CATEGORY_INFORMATIVA")
 
-# ID Ruoli Braccio Armato
-ROLE_BRACCIO_1 = get_id("ROLE_BRACCIO_1") 
-ROLE_BRACCIO_2 = get_id("ROLE_BRACCIO_2") 
+# ID Ruoli Braccio Armato (Capo, Vice Capo) - Chi può chiudere
+ROLE_BRACCIO_1 = get_id("ROLE_BRACCIO_1") # 1518931117670006914
+ROLE_BRACCIO_2 = get_id("ROLE_BRACCIO_2") # 1518931069485711492
 
-# ID Ruoli Informativa
-ROLE_INFO_1    = get_id("ROLE_INFO_1")    
-ROLE_INFO_2    = get_id("ROLE_INFO_2")    
+# ID Ruoli Informativa (Gestore, Vice Gestore) - Chi può chiudere
+ROLE_INFO_1    = get_id("ROLE_INFO_1")    # 1518931554397585418
+ROLE_INFO_2    = get_id("ROLE_INFO_2")    # 1518934838642741301
+
+# Canale Log Transcript
+LOG_CHANNEL_ID = get_id("LOG_CHANNEL_ID") # 1520748062455238827
 
 BANNER_URL = os.getenv("BANNER_URL")
 LOGO_URL   = os.getenv("LOGO_URL")
 
 intents = discord.Intents.default()
-intents.message_content = True # Necessario per leggere !messaggio
+intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-# Prefix impostato su "!"
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-
 # ─────────────────────────────────────────────
-#  SELECT MENU (Parte del Pannello Principale)
+#  SELECT MENU
 # ────────────────────────────────────────────
 
 class TicketTypeSelect(Select):
@@ -119,7 +122,7 @@ class TicketTypeSelect(Select):
             )
 
         if not category_id:
-            return await interaction.followup.send("Errore configurazione.", ephemeral=True)
+            return await interaction.followup.send("Errore di configurazione.", ephemeral=True)
 
         category = guild.get_channel(category_id)
         if not category:
@@ -161,7 +164,7 @@ class TicketTypeSelect(Select):
                 embed_welcome.set_thumbnail(url=LOGO_URL)
             embed_welcome.set_footer(text="!19 Service Center")
 
-            close_view = CloseTicketView()
+            close_view = CloseTicketView(ticket_type=ticket_type)
             await channel.send(embed=embed_welcome, view=close_view)
 
             await interaction.followup.send(f"Ticket creato: {channel.mention}", ephemeral=True)
@@ -179,17 +182,122 @@ class TicketPanelView(View):
 
 
 # ────────────────────────────────────────────
-#  PULSANTE CHIUDI TICKET
+#  PULSANTE CHIUDI TICKET CON CONTROLLI RUOLI
 # ────────────────────────────────────────────
 
 class CloseTicketView(View):
-    def __init__(self):
+    def __init__(self, ticket_type):
         super().__init__(timeout=None)
+        self.ticket_type = ticket_type
 
     @discord.ui.button(label="CHIUDI TICKET", style=discord.ButtonStyle.danger, custom_id="close_ticket")
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Ticket chiuso ed eliminato.", ephemeral=True)
-        await interaction.channel.delete()
+        user = interaction.user
+        guild = interaction.guild
+        
+        allowed_roles = []
+        if self.ticket_type == "braccio":
+            allowed_roles = [ROLE_BRACCIO_1, ROLE_BRACCIO_2]
+        else:
+            allowed_roles = [ROLE_INFO_1, ROLE_INFO_2]
+        
+        has_permission = any(role.id in allowed_roles for role in user.roles)
+        
+        if not has_permission and not user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "Non hai i permessi per chiudere questo ticket. Solo lo staff autorizzato può farlo.", 
+                ephemeral=True
+            )
+
+        await interaction.response.send_message("Generazione transcript e chiusura in corso...", ephemeral=True)
+        
+        try:
+            transcript_html = await generate_transcript(interaction.channel)
+            
+            log_channel = guild.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                file = discord.File(io.BytesIO(transcript_html.encode('utf-8')), filename=f"transcript-{interaction.channel.name}.html")
+                embed_log = discord.Embed(
+                    title=f"Transcript Chiuso: {interaction.channel.name}",
+                    description=f"Ticket chiuso da {user.mention}\nTipo: **{self.ticket_type.capitalize()}**",
+                    color=0xff4500 if self.ticket_type == "braccio" else 0x3498db,
+                    timestamp=discord.utils.utcnow()
+                )
+                embed_log.add_field(name="Utente Ticket", value=interaction.channel.name.replace(f"{self.ticket_type}-", ""), inline=True)
+                await log_channel.send(embed=embed_log, file=file)
+            
+            await interaction.channel.delete()
+            
+        except Exception as e:
+            await interaction.followup.send(f"Errore durante la chiusura: {e}", ephemeral=True)
+
+# ────────────────────────────────────────────
+#  GENERATORE TRANSCRIPT HTML
+# ────────────────────────────────────────────
+
+async def generate_transcript(channel):
+    messages = []
+    async for message in channel.history(limit=None, oldest_first=True):
+        attachments_list = []
+        if message.attachments:
+            for att in message.attachments:
+                attachments_list.append(f'<a href="{att.url}" target="_blank" style="color:#ff4500; text-decoration:none;">[Allegato: {att.filename}]</a>')
+        
+        content = message.content.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        if not content and not attachments_list:
+            content = "<i>(Nessun contenuto)</i>"
+        
+        attachments_html = " ".join(attachments_list)
+        
+        time_str = message.created_at.strftime("%d/%m/%Y %H:%M")
+        
+        messages.append(f"""
+        <div class="message">
+            <div class="avatar"></div>
+            <div class="content">
+                <div class="header">
+                    <span class="username" style="color:{message.author.color if message.author.color.value != 0 else '#ffffff'}">{message.author.display_name}</span>
+                    <span class="timestamp">{time_str}</span>
+                </div>
+                <div class="text">{content}</div>
+                {f'<div class="attachments">{attachments_html}</div>' if attachments_html else ''}
+            </div>
+        </div>
+        """)
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Transcript: {channel.name}</title>
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #36393f; color: #dcddde; margin: 0; padding: 20px; }}
+            .container {{ max-width: 900px; margin: 0 auto; background-color: #2f3136; padding: 20px; border-radius: 5px; }}
+            .header {{ text-align: center; border-bottom: 2px solid #ff4500; padding-bottom: 20px; margin-bottom: 20px; }}
+            .header h1 {{ color: #fff; margin: 0; }}
+            .message {{ display: flex; margin-bottom: 15px; padding: 10px; border-radius: 5px; background-color: #40444b; }}
+            .avatar {{ width: 40px; height: 40px; border-radius: 50%; background-color: #72767d; margin-right: 15px; flex-shrink: 0; }}
+            .content {{ flex: 1; }}
+            .header {{ display: flex; align-items: baseline; margin-bottom: 5px; }}
+            .username {{ font-weight: bold; margin-right: 10px; }}
+            .timestamp {{ font-size: 0.75rem; color: #72767d; }}
+            .text {{ word-wrap: break-word; line-height: 1.4; }}
+            .attachments {{ margin-top: 5px; font-size: 0.9rem; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Transcript Ticket: {channel.name}</h1>
+                <p>Generato automaticamente da !19 Bot</p>
+            </div>
+            {''.join(messages)}
+        </div>
+    </body>
+    </html>
+    """
+    return html_content
 
 
 # ─────────────────────────────────────────────
@@ -203,7 +311,6 @@ async def on_ready():
     print(f" Loggato come: {bot.user}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     bot.add_view(TicketPanelView())
-    bot.add_view(CloseTicketView())
     try:
         synced = await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
         print(f" Comandi slash sincronizzati: {len(synced)}")
@@ -212,8 +319,8 @@ async def on_ready():
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
-# ───────────────────────────────────────────
-#  COMANDI SLASH (/ticket)
+# ────────────────────────────────────────────
+#  COMANDI SLASH
 # ────────────────────────────────────────────
 
 @bot.tree.command(name="ticket", description="Apri il pannello di reclutamento !19.", guild=discord.Object(id=GUILD_ID))
@@ -250,16 +357,8 @@ async def ticket_cmd(interaction: discord.Interaction):
         await interaction.followup.send(f"Errore: {e}", ephemeral=True)
 
 
-# ───────────────────────────────────────────
-#  COMANDO TESTUALE (!messaggio)
-# ────────────────────────────────────────────
-
 @bot.command(name="messaggio")
 async def msg_cmd(ctx, *, testo: str):
-    """
-    Uso: !messaggio Il tuo testo qui con spazi
-    Invia il messaggio esattamente come scritto tramite Webhook.
-    """
     if not testo:
         return await ctx.send("Devi scrivere un messaggio dopo il comando.", delete_after=5)
 
@@ -270,41 +369,21 @@ async def msg_cmd(ctx, *, testo: str):
         if not webhook:
             webhook = await ctx.channel.create_webhook(name="!19 Official")
         
-        # Invia preservando TUTTI gli spazi e la formattazione
         await webhook.send(
             content=testo,
             username="!19",
             avatar_url=bot.user.display_avatar.url if bot.user.avatar else None
         )
         
-        # Cancella il comando dell'utente per pulizia (opzionale)
         try:
             await ctx.message.delete()
         except:
             pass
             
     except discord.Forbidden:
-        await ctx.send("Errore: Il bot necessita del permesso 'Gestisci Webhook'.", delete_after=5)
+        await ctx.send("Errore: Il bot necessita del permesso Gestisci Webhook.", delete_after=5)
     except Exception as e:
         await ctx.send(f"Errore: {e}", delete_after=5)
 
-@bot.event
-async def on_member_join(member):
-    # ID del ruolo da assegnare
-    role_id = 1518932682476621964
-    
-    # Cerca il ruolo nel server
-    role = member.guild.get_role(role_id)
-    
-    if role:
-        try:
-            await member.add_roles(role)
-            print(f"Ruolo assegnato a {member.name}")
-        except discord.Forbidden:
-            print(f"Errore: Il bot non ha i permessi per assegnare il ruolo a {member.name}")
-        except Exception as e:
-            print(f"Errore imprevisto: {e}")
-    else:
-        print(f"Errore: Ruolo con ID {role_id} non trovato nel server.")
 
 bot.run(TOKEN)
