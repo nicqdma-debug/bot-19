@@ -385,5 +385,23 @@ async def msg_cmd(ctx, *, testo: str):
     except Exception as e:
         await ctx.send(f"Errore: {e}", delete_after=5)
 
+# --- AGGIUNTA PER RENDER FREE TIER ---
+import threading
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot !19 è Online!"
+
+def run_flask():
+    # Apre la porta che Render si aspetta (default 10000 o quella definita da env)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# Avvia il server web in un thread separato così non blocca il bot
+threading.Thread(target=run_flask).start()
+# -------------------------------------
 
 bot.run(TOKEN)
